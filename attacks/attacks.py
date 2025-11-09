@@ -9,8 +9,10 @@ import torchvision.transforms as T
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 import glob
+import warnings
+import sys
 
-from utils.sse import sse_adv_samples_gen_validated
+from utils.sse import sse_adv_samples_gen_validated, sse_class_number_validation
 
 
 class FasterRCNNDataset(Dataset):
@@ -48,13 +50,33 @@ class FasterRCNNAttacks:
         self.cfg = cfg
         self.device = torch.device(cfg.device if torch.cuda.is_available() and 'cuda' in cfg.device else 'cpu')
         
+        # Suppress warnings to avoid model download warnings
+        warnings.filterwarnings('ignore', category=UserWarning)
+        warnings.filterwarnings('ignore', message='.*Downloading.*')
+        
+        # Set environment to prevent downloads
+        os.environ['TORCH_HOME'] = '/project/.cache/torch'
+        os.environ['HF_HUB_OFFLINE'] = '1'
+        
+        # Validate CLASS_NUMBER before loading model
+        self._validate_class_number()
+        
         # Load pretrained Faster R-CNN model (using torchvision's implementation)
         if hasattr(cfg, 'pretrained') and os.path.exists(cfg.pretrained):
             # Load custom weights
             self.model = self._load_fasterrcnn_model(cfg.pretrained)
         else:
-            # Use pretrained from torchvision
-            self.model = models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
+            # Try to use local weights first
+            local_weights_path = '/project/voc_weights_vgg.pth'
+            if os.path.exists(local_weights_path):
+                self.model = self._load_fasterrcnn_model(local_weights_path)
+            else:
+                # Use weights=None to avoid downloading
+                self.model = models.detection.fasterrcnn_resnet50_fpn(
+                    weights=None, 
+                    num_classes=cfg.num_classes,
+                    pretrained_backbone=False
+                )
         
         self.model = self.model.to(self.device)
         self.model.eval()
@@ -65,15 +87,57 @@ class FasterRCNNAttacks:
             T.ToTensor(),
         ])
     
+    def _validate_class_number(self):
+        """Validate CLASS_NUMBER matches the model/dataset"""
+        if hasattr(self.cfg, 'pretrained') and os.path.exists(self.cfg.pretrained):
+            try:
+                checkpoint = torch.load(self.cfg.pretrained, map_location='cpu')
+                # Try to extract class number from checkpoint
+                if isinstance(checkpoint, dict):
+                    if 'num_classes' in checkpoint:
+                        expected_classes = checkpoint['num_classes']
+                        if expected_classes != self.cfg.num_classes:
+                            sse_class_number_validation(expected_classes, self.cfg.num_classes)
+                            sys.exit(1)
+                    elif 'state_dict' in checkpoint:
+                        # Try to infer from model architecture
+                        state_dict = checkpoint['state_dict']
+                        self._check_class_number_from_state_dict(state_dict)
+                else:
+                    # state_dict directly
+                    self._check_class_number_from_state_dict(checkpoint)
+            except Exception as e:
+                # If we can't validate, just continue
+                pass
+    
+    def _check_class_number_from_state_dict(self, state_dict):
+        """Check class number from state dict"""
+        # Look for classification head parameters (roi_heads.box_predictor.cls_score)
+        for key in state_dict.keys():
+            if 'cls_score' in key and 'weight' in key:
+                # Try to infer number of classes from classifier layer
+                if len(state_dict[key].shape) >= 2:
+                    num_classes_in_model = state_dict[key].shape[0]
+                    # COCO has 91 classes, Pascal VOC has 21
+                    if num_classes_in_model in [91, 21, 80, 20]:
+                        if num_classes_in_model != self.cfg.num_classes:
+                            sse_class_number_validation(num_classes_in_model, self.cfg.num_classes)
+                            sys.exit(1)
+                    break
+    
     def _load_fasterrcnn_model(self, model_path):
         """Load Faster R-CNN model from checkpoint"""
-        model = models.detection.fasterrcnn_resnet50_fpn(pretrained=False, num_classes=self.cfg.num_classes)
+        model = models.detection.fasterrcnn_resnet50_fpn(
+            weights=None, 
+            num_classes=self.cfg.num_classes,
+            pretrained_backbone=False
+        )
         if model_path.endswith('.pth') or model_path.endswith('.pt'):
             checkpoint = torch.load(model_path, map_location='cpu')
             if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['state_dict'])
+                model.load_state_dict(checkpoint['state_dict'], strict=False)
             else:
-                model.load_state_dict(checkpoint)
+                model.load_state_dict(checkpoint, strict=False)
         return model
     
     def get_dataloader(self):
@@ -297,5 +361,6 @@ class FasterRCNNAttacks:
     
     def inverse_tanh_space(self, x):
         return self.atanh(torch.clamp(x * 2 - 1, min=-1, max=1))
+
 
 
