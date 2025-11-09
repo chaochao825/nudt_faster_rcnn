@@ -4,6 +4,7 @@
 *.pt
 *.ckpt
 *.bin
+*.pth
 
 # Python / 环境
 __pycache__/
@@ -29,5 +30,4 @@ vehicle/input/weights/
 *.tar
 *.tar.gz
 *.tgz
-*.pth
 *.weights
