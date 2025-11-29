@@ -186,15 +186,6 @@ event: adv_samples_gen_validated
 data: {"status": "success", "message": "adv sample is generated.", "file_name": "/project/output/adv_images/adv_image_0_0.jpg"}
 ```
 
-## 系统要求
-- Python 3.8
-- PyTorch 2.4.0
-- torchvision 0.19.0
-- CUDA 12.1 (用于 GPU 支持)
-- 查看 [requirements.txt](requirements.txt) 了解完整列表
-
-## 测试
-使用提供的测试脚本验证实现：
 ```bash
 python image-test.py
 ```
@@ -206,6 +197,5 @@ python image-test.py
 1. adv、attack 和 train 模式需要 GPU
 2. 防御模式默认在 CPU 上运行
 3. 确保输入目录包含模型权重和数据集
-4. 所有输出遵循 SSE 格式，便于与后端 API 集成
-5. 使用 ResNet-50-FPN 骨干网络（torchvision 默认）而非 VGG16
+4. 使用 ResNet-50-FPN 骨干网络（torchvision 默认）而非 VGG16
 
