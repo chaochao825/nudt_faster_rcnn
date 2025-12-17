@@ -17,8 +17,31 @@ import json
 warnings.filterwarnings('ignore')
 os.environ['PYTHONWARNINGS'] = 'ignore'
 
-from utils.sse import sse_adv_samples_gen_validated, sse_class_number_validation, sse_final_result
+from utils.sse import sse_adv_samples_gen_validated, sse_class_number_validation, sse_final_result, sse_print, sse_error, save_json_results
 
+def smart_load_dataset(data_path, max_extract=50):
+    """Smart dataset loader"""
+    from pathlib import Path
+    import zipfile
+    data_path = Path(data_path)
+    zip_files = list(data_path.glob('*.zip')) + list(data_path.glob('*/*.zip'))
+    if zip_files:
+        extract_dir = data_path / '.extracted' / zip_files[0].stem
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        if len(list(extract_dir.rglob('*.jpg'))) >= 10:
+            return str(extract_dir)
+        try:
+            with zipfile.ZipFile(zip_files[0], 'r') as zf:
+                for m in [m for m in zf.namelist() if m.endswith(('.jpg', '.png'))][:max_extract]:
+                    try: zf.extract(m, extract_dir)
+                    except: pass
+            if list(extract_dir.rglob('*.jpg')):
+                return str(extract_dir)
+        except: pass
+    if list(data_path.rglob('*.jpg')):
+        return str(data_path)
+    fallback = Path(__file__).parent.parent / 'test_data'
+    return str(fallback) if fallback.exists() else str(data_path)
 
 class FasterRCNNDataset(Dataset):
     """Simple dataset for loading images"""
@@ -53,15 +76,29 @@ class FasterRCNNAttacks:
     
     def __init__(self, cfg):
         self.cfg = cfg
-        self.device = torch.device(cfg.device if torch.cuda.is_available() and 'cuda' in cfg.device else 'cpu')
+        
+        # Smart dataset loading
+        sse_print("checking_dataset", {}, progress=22, message="Checking dataset", log="[22%] Loading dataset\n")
+        cfg.data_path = smart_load_dataset(cfg.data_path)
+        sse_print("dataset_ready", {}, progress=23, message="Dataset ready", log="[23%] Dataset loaded\n")
+        
+        # Configure device with proper CUDA settings
+        if torch.cuda.is_available() and 'cuda' in cfg.device:
+            self.device = torch.device(cfg.device)
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False
+        else:
+            self.device = torch.device('cpu')
         
         # Suppress warnings to avoid model download warnings
         warnings.filterwarnings('ignore', category=UserWarning)
         warnings.filterwarnings('ignore', message='.*Downloading.*')
+        warnings.filterwarnings('ignore', category=FutureWarning)
         
         # Set environment to prevent downloads
         os.environ['TORCH_HOME'] = '/project/.cache/torch'
         os.environ['HF_HUB_OFFLINE'] = '1'
+        os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
         
         # Validate CLASS_NUMBER before loading model
         self._validate_class_number()
@@ -159,12 +196,24 @@ class FasterRCNNAttacks:
     
     def run_adv(self, args):
         """Generate adversarial samples"""
+        sse_print("attack_process_start", {}, progress=25, 
+                 message=f"Starting {args.attack_method.upper()} adversarial sample generation",
+                 log=f"[25%] Initializing {args.attack_method.upper()} attack with epsilon={args.epsilon}\n")
+        
         os.makedirs(f'{self.cfg.save_dir}/adv_images', exist_ok=True)
         dataloader = self.get_dataloader()
         
-        total_images = 0
+        total_images_dataset = len(dataloader.dataset)
+        processed_images = 0
+        output_files = []
+        
         for batch_i, batch in enumerate(dataloader):
             batch = self.preprocess(batch)
+            
+            sse_print("processing_image", {}, 
+                     progress=int(25 + (batch_i / len(dataloader)) * 60),
+                     message=f"Processing batch {batch_i + 1}/{len(dataloader)}",
+                     log=f"[{int(25 + (batch_i / len(dataloader)) * 60)}%] Generating adversarial perturbations for batch {batch_i + 1}\n")
             
             if args.attack_method == 'pgd':
                 adv_images = self.pgd(batch['img'], eps=args.epsilon, alpha=args.step_size, 
@@ -179,6 +228,7 @@ class FasterRCNNAttacks:
             elif args.attack_method == 'deepfool':
                 adv_images, _ = self.deepfool(batch['img'], steps=args.max_iterations, overshoot=0.02)
             else:
+                sse_error(f'Invalid attack method: {args.attack_method}')
                 raise ValueError(f'Invalid attack method: {args.attack_method}')
             
             # Save adversarial images
@@ -187,17 +237,39 @@ class FasterRCNNAttacks:
                 pil_image = to_pil(adv_images[i].cpu())
                 adv_image_name = f'{self.cfg.save_dir}/adv_images/adv_image_{batch_i}_{i}.jpg'
                 pil_image.save(adv_image_name)
-                sse_adv_samples_gen_validated(adv_image_name)
-                total_images += 1
+                output_files.append(adv_image_name)
+                processed_images += 1
+                sse_adv_samples_gen_validated(adv_image_name, processed_images, total_images_dataset)
+        
+        sse_print("attack_generation_complete", {}, progress=90,
+                 message="Adversarial samples generated successfully",
+                 log=f"[90%] Successfully generated {processed_images} adversarial samples\n")
         
         # Output final result
         final_results = {
             "status": "success",
-            "total_adversarial_samples": total_images,
+            "message": f"{args.attack_method.upper()} adversarial generation completed",
+            "total_adversarial_samples": processed_images,
             "attack_method": args.attack_method,
             "epsilon": float(args.epsilon),
-            "output_path": f'{self.cfg.save_dir}/adv_images'
+            "output_path": f'{self.cfg.save_dir}/adv_images',
+            "attack_parameters": {
+                "epsilon": float(args.epsilon),
+                "step_size": float(args.step_size),
+                "max_iterations": args.max_iterations
+            },
+            "output_info": {
+                "output_files": len(output_files),
+                "output_directory": f'{self.cfg.save_dir}/adv_images'
+            }
         }
+        
+        json_path = save_json_results(final_results, self.cfg.save_dir, f"{args.attack_method}_adv_results.json")
+        sse_print("results_saved", {}, progress=95,
+                 message="Results saved to JSON file",
+                 log=f"[95%] Results saved to {json_path}\n",
+                 details={"json_path": json_path})
+        
         sse_final_result(final_results)
     
     def run_attack(self, args):
